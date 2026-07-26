@@ -71,9 +71,32 @@ async def process_default_inputs(
                 f"Trigger default input '{k}' must be an input to the task, but not found in task {task_name}. "
                 f"Available inputs: {list(variables_dict.keys())}"
             )
-        else:
-            literal_coros.append(flyte.types.TypeEngine.to_literal(v, type(v), variables_dict[k].type))
-            keys.append(k)
+        # Runtime list/dict types lose generic element information. Recover it
+        # only when the declared type, or one of its union variants, is a
+        # Flyte collection or typed map.
+        expected_type = variables_dict[k].type
+        python_type = type(v)
+        is_typed_list = isinstance(v, list) and expected_type.HasField("collection_type")
+        is_typed_map = isinstance(v, dict) and expected_type.HasField("map_value_type")
+        is_union_list = (
+            isinstance(v, list)
+            and expected_type.HasField("union_type")
+            and any(var.HasField("collection_type") for var in expected_type.union_type.variants)
+        )
+        is_union_map = (
+            isinstance(v, dict)
+            and expected_type.HasField("union_type")
+            and any(var.HasField("map_value_type") for var in expected_type.union_type.variants)
+        )
+        if is_typed_list or is_typed_map or is_union_list or is_union_map:
+            try:
+                python_type = flyte.types.TypeEngine.guess_python_type(expected_type)
+            except (ValueError, TypeError) as e:
+                raise RuntimeError(
+                    f"Failed to infer Python type for trigger default input '{k}': {e}"
+                ) from e
+        literal_coros.append(flyte.types.TypeEngine.to_literal(v, python_type, expected_type))
+        keys.append(k)
 
     final_literals: list[literals_pb2.Literal] = cast(
         "list[literals_pb2.Literal]", await asyncio.gather(*literal_coros, return_exceptions=True)

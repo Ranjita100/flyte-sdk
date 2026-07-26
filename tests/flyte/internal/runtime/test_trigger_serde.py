@@ -1,4 +1,6 @@
+import enum
 from datetime import datetime
+from unittest.mock import patch
 
 import pytest
 from flyteidl2.core import interface_pb2, literals_pb2, types_pb2
@@ -182,6 +184,310 @@ class TestProcessDefaultInputs:
         assert result[0].value.scalar.primitive.integer == 10
         assert result[1].name == "b"
         assert result[1].value.scalar.primitive.string_value == "default_b"
+
+    @pytest.mark.asyncio
+    async def test_collection_default_input(self):
+        """Trigger inputs with a plain Python list must be converted using the
+        task interface's type (List[int]), not type(value) which would be bare
+        `list` and cause TypeEngine to fall back to PickleFile/BINARY."""
+        task_inputs = interface_pb2.VariableMap(
+            variables=[
+                VariableEntry(
+                    key="x_list",
+                    value=interface_pb2.Variable(
+                        type=types_pb2.LiteralType(
+                            collection_type=types_pb2.LiteralType(simple=types_pb2.SimpleType.INTEGER)
+                        )
+                    ),
+                )
+            ]
+        )
+
+        default_inputs = {"x_list": list(range(5))}
+
+        result = await process_default_inputs(default_inputs, "test_task", task_inputs, [])
+
+        assert len(result) == 1
+        assert result[0].name == "x_list"
+        # Must be a collection of integer primitives, not a PickleFile scalar
+        assert result[0].value.HasField("collection"), (
+            "Expected collection literal but got scalar (PickleFile); "
+            "trigger_serde must use the task interface type, not type(value)"
+        )
+        assert len(result[0].value.collection.literals) == 5
+        assert [lit.scalar.primitive.integer for lit in result[0].value.collection.literals] == [0, 1, 2, 3, 4]
+
+    @pytest.mark.asyncio
+    async def test_collection_default_input_empty_list(self):
+        """Empty list: element type cannot be inferred from the value; task interface must be used."""
+        task_inputs = interface_pb2.VariableMap(
+            variables=[
+                VariableEntry(
+                    key="x_list",
+                    value=interface_pb2.Variable(
+                        type=types_pb2.LiteralType(collection_type=types_pb2.LiteralType(simple=types_pb2.SimpleType.INTEGER))
+                    ),
+                )
+            ]
+        )
+
+        result = await process_default_inputs({"x_list": []}, "test_task", task_inputs, [])
+
+        assert len(result) == 1
+        assert result[0].value.HasField("collection")
+        assert len(result[0].value.collection.literals) == 0
+
+    @pytest.mark.asyncio
+    async def test_container_guess_value_error_includes_input_context(self):
+        """ValueError during container type inference includes the trigger input name."""
+        task_inputs = interface_pb2.VariableMap(
+            variables=[
+                VariableEntry(
+                    key="x_list",
+                    value=interface_pb2.Variable(
+                        type=types_pb2.LiteralType(
+                            collection_type=types_pb2.LiteralType(simple=types_pb2.SimpleType.INTEGER)
+                        )
+                    ),
+                )
+            ]
+        )
+
+        with patch.object(TypeEngine, "guess_python_type", side_effect=ValueError("no reverse")):
+            with pytest.raises(RuntimeError, match="Failed to infer Python type for trigger default input 'x_list'"):
+                await process_default_inputs({"x_list": [1, 2, 3]}, "test_task", task_inputs, [])
+
+    @pytest.mark.asyncio
+    async def test_enum_default_input_uses_runtime_type(self):
+        """Enum trigger defaults must serialize using the original enum class, not the
+        dynamically reconstructed DynamicEnum returned by guess_python_type().
+        EnumTransformer.assert_type checks isinstance(v, python_type); a DynamicEnum
+        would fail that check even though the value is a valid Color member."""
+        class Color(enum.Enum):
+            RED = "red"
+            BLUE = "blue"
+
+        enum_literal_type = TypeEngine.to_literal_type(Color)
+        task_inputs = interface_pb2.VariableMap(
+            variables=[
+                VariableEntry(
+                    key="color",
+                    value=interface_pb2.Variable(type=enum_literal_type),
+                )
+            ]
+        )
+
+        result = await process_default_inputs({"color": Color.RED}, "test_task", task_inputs, [])
+
+        assert len(result) == 1
+        assert result[0].name == "color"
+        assert result[0].value.scalar.primitive.string_value == "RED"
+
+    @pytest.mark.asyncio
+    async def test_enum_default_input_does_not_call_guess_python_type(self):
+        """Prove that the container-narrowing logic never calls guess_python_type() for
+        enum defaults.  If it did, EnumTransformer would return a DynamicEnum class and
+        the isinstance assert_type check would fail."""
+        class Color(enum.Enum):
+            RED = "red"
+            BLUE = "blue"
+
+        enum_literal_type = TypeEngine.to_literal_type(Color)
+        task_inputs = interface_pb2.VariableMap(
+            variables=[
+                VariableEntry(
+                    key="color",
+                    value=interface_pb2.Variable(type=enum_literal_type),
+                )
+            ]
+        )
+
+        with patch.object(TypeEngine, "guess_python_type") as mock_guess:
+            result = await process_default_inputs({"color": Color.RED}, "test_task", task_inputs, [])
+
+        mock_guess.assert_not_called()
+        assert len(result) == 1
+        assert result[0].name == "color"
+        assert result[0].value.scalar.primitive.string_value == "RED"
+
+    @pytest.mark.asyncio
+    async def test_optional_list_default_input(self):
+        """Optional[list[int]] (union of collection<int> and None): a plain list value must
+        produce a collection literal, not BINARY.  UnionTransformer reverses the union type
+        by recursively guessing each variant, so the fix covers this case too."""
+        task_inputs = interface_pb2.VariableMap(
+            variables=[
+                VariableEntry(
+                    key="x_list",
+                    value=interface_pb2.Variable(
+                        type=types_pb2.LiteralType(
+                            union_type=types_pb2.UnionType(
+                                variants=[
+                                    types_pb2.LiteralType(
+                                        collection_type=types_pb2.LiteralType(simple=types_pb2.SimpleType.INTEGER)
+                                    ),
+                                    types_pb2.LiteralType(simple=types_pb2.SimpleType.NONE),
+                                ]
+                            )
+                        )
+                    ),
+                )
+            ]
+        )
+
+        result = await process_default_inputs({"x_list": [10, 20, 30]}, "test_task", task_inputs, [])
+
+        assert len(result) == 1
+        assert result[0].name == "x_list"
+        # Must be a union scalar wrapping a collection, not BINARY
+        union_val = result[0].value.scalar.union.value
+        assert union_val.HasField("collection"), "Expected collection inside union, got scalar (PickleFile)"
+        assert len(union_val.collection.literals) == 3
+        assert [lit.scalar.primitive.integer for lit in union_val.collection.literals] == [10, 20, 30]
+
+    @pytest.mark.asyncio
+    async def test_none_value_optional_list_input(self):
+        """None passed to Optional[list[int]] must not go through guess_python_type().
+        isinstance(None, (list, dict)) is False, so type(None) is used and the
+        UnionTransformer serialises it as a none literal."""
+        task_inputs = interface_pb2.VariableMap(
+            variables=[
+                VariableEntry(
+                    key="x_list",
+                    value=interface_pb2.Variable(
+                        type=types_pb2.LiteralType(
+                            union_type=types_pb2.UnionType(
+                                variants=[
+                                    types_pb2.LiteralType(
+                                        collection_type=types_pb2.LiteralType(simple=types_pb2.SimpleType.INTEGER)
+                                    ),
+                                    types_pb2.LiteralType(simple=types_pb2.SimpleType.NONE),
+                                ]
+                            )
+                        )
+                    ),
+                )
+            ]
+        )
+
+        result = await process_default_inputs({"x_list": None}, "test_task", task_inputs, [])
+
+        assert len(result) == 1
+        assert result[0].name == "x_list"
+        # isinstance(None, (list, dict)) is False so the container path is skipped.
+        # The union serialiser selects the NONE variant.
+        literal = result[0].value
+        assert literal.HasField("scalar")
+        assert literal.scalar.HasField("none_type")
+
+    @pytest.mark.asyncio
+    async def test_dict_union_without_map_variant_does_not_call_guess_python_type(self):
+        """A dict passed to a union with no map_value_type variant must not trigger
+        guess_python_type(). The guard inspects union variants, not just the union flag."""
+        task_inputs = interface_pb2.VariableMap(
+            variables=[
+                VariableEntry(
+                    key="data",
+                    value=interface_pb2.Variable(
+                        type=types_pb2.LiteralType(
+                            union_type=types_pb2.UnionType(
+                                variants=[
+                                    types_pb2.LiteralType(simple=types_pb2.SimpleType.STRING),
+                                    types_pb2.LiteralType(simple=types_pb2.SimpleType.NONE),
+                                ]
+                            )
+                        )
+                    ),
+                )
+            ]
+        )
+
+        with patch.object(TypeEngine, "guess_python_type") as mock_guess:
+            with patch.object(TypeEngine, "to_literal", side_effect=RuntimeError("serialization not under test")):
+                with pytest.raises(RuntimeError, match="Failed to convert trigger default input 'data'"):
+                    await process_default_inputs({"data": {"key": "value"}}, "test_task", task_inputs, [])
+
+        mock_guess.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_optional_dict_default_input(self):
+        """Optional[dict[str,int]] (union of map<int> and None): a plain dict value must
+        produce a map literal, not BINARY. Symmetric coverage for is_union_map."""
+        task_inputs = interface_pb2.VariableMap(
+            variables=[
+                VariableEntry(
+                    key="counts",
+                    value=interface_pb2.Variable(
+                        type=types_pb2.LiteralType(
+                            union_type=types_pb2.UnionType(
+                                variants=[
+                                    types_pb2.LiteralType(
+                                        map_value_type=types_pb2.LiteralType(simple=types_pb2.SimpleType.INTEGER)
+                                    ),
+                                    types_pb2.LiteralType(simple=types_pb2.SimpleType.NONE),
+                                ]
+                            )
+                        )
+                    ),
+                )
+            ]
+        )
+
+        result = await process_default_inputs({"counts": {"a": 1, "b": 2}}, "test_task", task_inputs, [])
+
+        assert len(result) == 1
+        assert result[0].name == "counts"
+        union_val = result[0].value.scalar.union.value
+        assert union_val.HasField("map"), "Expected map inside union, got scalar (PickleFile)"
+        assert union_val.map.literals["a"].scalar.primitive.integer == 1
+        assert union_val.map.literals["b"].scalar.primitive.integer == 2
+
+    @pytest.mark.asyncio
+    async def test_dict_default_input(self):
+        """A plain dict value for a Dict[str, int] input must produce a map literal, not BINARY.
+        Same class of bug as the list case: type(v) == dict loses the value-type information."""
+        task_inputs = interface_pb2.VariableMap(
+            variables=[
+                VariableEntry(
+                    key="counts",
+                    value=interface_pb2.Variable(
+                        type=types_pb2.LiteralType(
+                            map_value_type=types_pb2.LiteralType(simple=types_pb2.SimpleType.INTEGER)
+                        )
+                    ),
+                )
+            ]
+        )
+
+        result = await process_default_inputs({"counts": {"a": 1, "b": 2}}, "test_task", task_inputs, [])
+
+        assert len(result) == 1
+        assert result[0].name == "counts"
+        assert result[0].value.HasField("map"), "Expected map literal but got scalar (PickleFile)"
+        assert result[0].value.map.literals["a"].scalar.primitive.integer == 1
+        assert result[0].value.map.literals["b"].scalar.primitive.integer == 2
+
+    @pytest.mark.asyncio
+    async def test_dict_default_input_empty(self):
+        """Empty dict: value type cannot be inferred from the value; task interface must be used."""
+        task_inputs = interface_pb2.VariableMap(
+            variables=[
+                VariableEntry(
+                    key="counts",
+                    value=interface_pb2.Variable(
+                        type=types_pb2.LiteralType(
+                            map_value_type=types_pb2.LiteralType(simple=types_pb2.SimpleType.INTEGER)
+                        )
+                    ),
+                )
+            ]
+        )
+
+        result = await process_default_inputs({"counts": {}}, "test_task", task_inputs, [])
+
+        assert len(result) == 1
+        assert result[0].value.HasField("map")
+        assert len(result[0].value.map.literals) == 0
 
     @pytest.mark.asyncio
     async def test_trigger_defaults_override_task_defaults(self):
